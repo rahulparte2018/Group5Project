@@ -1,0 +1,324 @@
+###############################################################################################
+###############################################################################################
+
+1) Import dataset from kaggle to EMR:
+
+>>> sudo yum update
+
+ *Installing the library*
+- Write the command ...>>> pip install kaggle
+
+*Setting up the API token*
+- Go to the kaggle website.
+- Click on Your profile button on the top right and then select My Account.
+- Scroll down to the API section and click on the Create New API Token button.
+- It will download the file kaggle.json & Save the file at a known location on your machine.
+- Move the downloaded file to a location:
+   ~/.kaggle/kaggle.json. 
+
+- If you don’t have the .kaggle folder in your home directory, you can create one using the command:
+>>> mkdir ~/.kaggle
+
+- Now move the downloaded file to this location using:
+>>> mv <location>/kaggle.json ~/.kaggle/kaggle.json
+
+- You need to give proper permissions to the file (since this is a hidden folder):
+>>> chmod 600 ~/.kaggle/kaggle.json
+
+- So if you find the location such as ~/.local/bin/kaggle, try running the kaggle command as:
+
+---echo $path
+---export PATH=$PATH:/home/hadoop/.local/bin
+above two commond are optional if kaggle commond is not recognize then run the above commond
+
+- Now start download the data from kaggle:
+>>> kaggle datasets download -d skihikingkevin/pubg-match-deaths
+>>> unzip pubg-match-deaths.zip
+
+##############################################################################################
+###############################################################################################
+
+2)Command for copy the data from EMR to s3:
+
+>>> aws s3 cp /home/hadoop/aggregate/ <s3 bucket path> --recursive
+>>> aws s3 cp /home/hadoop/deaths/ <s3 bucket path> --recursive
+ --recursive will travese all the directories within.
+
+
+-- Ignore this----
+{echo $785ae9891725caa4c3abf3c0b264b7c3
+kaggle datasets download -d skihikingkevin/pubg-match-deaths -u sarthakdwi -p 785ae9891725caa4c3abf3c0b264b7c3}
+
+############################################################################################################################
+
+3)Go to the pyspark on HDFS
+
+command....>>> pyspark
+
+- Read multiple csv from S3 to spark(Here we have merged all the files in one dataframe)   
+
+>>> match = spark.read.format("csv").option("header","true").option("inferSchema","true").load ("s3://bigdataprojectgroup5/aggregate/agg_match_stats_[0-4]*.csv")
+
+>>> death= spark.read.format("csv").option("header","true").option("inferSchema","true").load("s3://bigdataprojectgroup5/deaths/kill_match_stats_final_[0-4]*.csv")
+
+- Check count of rows:
+>>> match.count()
+>>>death.count()
+
+- Check schema
+>>> match.printSchema()
+>>> death.printSchema()
+
+##################################################################################################
+###############################################################################################
+
+4)Clean the data and store in parquet format:
+
+>>> from pyspark.sql.functions import split, col
+
+- match is a PySpark DataFrame with a date column which have date and time both separated with 'T' so we have to split first.
+>>> match_new = split(col("date"), "T")
+
+- Now create two column different column as date and time
+>>> match_new = match_new.select(match_new[0].alias("date"), match_new[1].alias("time"),"game_size", "match_id", "match_mode", "party_size", "player_assists", "player_dbno", "player_dist_ride", "player_dist_walk", "player_dmg", "player_kills", "player_name", "player_survive_time", "team_id", "team_placement")
+
+- Applying regex for cleaning the data.
+>>> d= r'\\+0000$'
+>>> b= r'\d{9}$'
+
+>>> match_clean = match_new.select("date",regexp_replace(match_new['time'],d,'').alias('time'), "game_size", "match_id", "match_mode", "party_size", "player_assists", "player_dbno", regexp_replace(match_new["player_dist_ride"],b,'').alias("player_dist_ride"), regexp_replace(match_new["player_dist_walk"],b,'').alias("player_dist_walk"), "player_dmg", "player_kills", "player_name", regexp_replace(match_new["player_survive_time"],b,'').alias("player_survive_time"), "team_id", "team_placement")
+
+>>> from pyspark.sql.functions import col, sum
+- let's see for null values
+>>> match_clean.select([sum(col(c).isNull().cast("integer")).alias(c) for c in match_clean.columns]).show()
+
+- Dropping rows with any null values
+>>> match_ok = match_clean.na.drop(how='any')
+
+- same for death dataframe
+>>> death.select([sum(col(c).isNull().cast("integer")).alias(c) for c in death.columns]).show()
+>>> death = death.na.drop(how='any')
+>>> death.select([sum(col(c).like("#unknown").cast("integer")).alias(c) for c in death.columns]).show()
+
+- changing the column name 
+>>> death= death.withColumnRenamed("killed_by","Weapon_name")
+>>> death.show(5)
+
+##################################################################################################
+###############################################################################################
+6)Save the cleaned data in S3 Bucket into parquet format.
+
+- run only one commond among below commonds 
+- if you want multiple parquet file
+>>> match_ok.write.format("parquet").mode("overwrite").save("<s3 bucket path>")
+
+- if you want single parquet file
+match_ok.coalesce(1).write.format("parquet").mode("overwrite").save("<s3 bucket path>")
+
+-- death.write.parquet(s3://bigdataprojectgroup5/new_deaths/death.parquet)
+- run only one commond at a time from the below commonds 
+>>> death.coalesce(1).write.format("parquet").mode("overwrite").save("<s3 bucket path>")
+>>> death.write.format("parquet").mode("overwrite").save("<s3 bucket path>")
+
+#################################################################################################
+###############################################################################################
+
+7)Run Glue Crawler on the parquet files
+- go to aws glue
+- select crawlers - create crawler - provide crawler name - next
+- configure data source - not yet - add data source - s3 - s3 data location in this account - s3 path where the parquet files are located - add s3 data source - next
+- select iam role - labrole - next
+- choose database or create new database - next
+- create crawler
+- run crawler
+
+this will extract the metadata from the parquet files and store it into Glue data catalog
+
+############################################################
+############################################################
+
+8)Querying data using Athena
+- go to aws Athena
+- select data source as awsdatacatalog
+- select the required database name as used in the above step
+- now use this to query data on the parquet files stored in s3
+- the output of athena is stored in S3 bucket
+
+############################################################
+############################################################
+
+9) connecting athena to Power BI
+A) Create ODBC connector
+- download simba athena odbc connector and install it on your system
+- open odbc data sources 64 bit - go to system DSN - click on Add - select simba athena odbc driver - finish - next - choose any data source name (remember it as dsn for powerbi) - aws region (us-east-1) - s3 output location (athena output query location) - authentication options - user (aws access key id) - password (aws secret key) - session token (aws session token) - ok - test - success - all ok - ok 
+B) Powerbi
+- open powerbi
+- get data 
+- search amazon athena - connect
+- provide dsn - select direct query - ok
+- choose use data source configuration option - connect
+- drop down aws data catalog - drop down required database - choose the required table to import - load
+- use this data to create your visualization
+
+############################################################
+############################################################
+
+10) Automate the preprocessing steps by using the following:
+A) AWS API GATEWAY:
+- it provides with http link to trigger lambda whenever the link is clicked, giving manual control to user.
+- kind of a push button to invoke lambda
+B) Lambda
+- we write a python code using boto3. this is used to create a session with the required authentication. using this session, create cloudformation client. use this client to create stack.
+C) Cloudformation
+- Create a cloudformation template to create instances of services with required configuration. 
+- here we create an EMR to run our spark job
+- it consists of sparksteps as key in the cloudformation template.
+
+############################################################
+############################################################
+LAMBDA CODE
+
+import boto3
+session = boto3.Session(region_name='us-east-1',
+	aws_access_key_id="",
+	aws_secret_access_key="",
+	aws_session_token="")
+cloud_cl_ob = session.client('cloudformation')
+
+params = [
+    {
+        "ParameterKey" : 'KeyName',
+        "ParameterValue" : 'keykey'
+    }
+]
+stack_template = 'HTTP URL FOR TEMPLATE STORED IN S3'
+cloud_cl_ob.create_stack(StackName="TestingEMRusingPythonS3URL", TemplateURL=stack_template, Parameters=params)
+
+
+############################################################
+############################################################
+CLOUD FORMATION TEMPLATE
+
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Parameters" : {
+      "InstanceType" : {
+        "Type" : "String",
+        "Default" : "m5.xlarge"
+      },
+      "ReleaseLabel" : {
+        "Type" : "String",
+        "Default" : "emr-6.10.0"
+      },
+      "SubnetId" : {
+        "Type" : "String",
+        "Default" : "subnet-048fd85f8f609b0a9"
+      },
+      "TerminationProtected" : {
+        "Type" : "String",
+        "Default" : "False"
+      },
+      "ElasticMapReducePrincipal" : {
+        "Type" : "String",
+        "Default" : "elasticmapreduce.amazonaws.com"
+      },
+      "Ec2Principal" : {
+        "Type" : "String",
+        "Default" : "ec2.amazonaws.com"
+      },
+      "EMRLogDir": {
+        "Description": "Log Dir for the EMR cluster",
+        "Default" : "s3://dbda-emr-testing/emr_test_logs/",
+        "Type": "String"
+      },
+      "KeyName": {
+        "Description": "Name of an existing EC2 KeyPair to enable SSH to the instances",
+        "Default" : "keykey",
+        "Type": "String"
+      }
+    },
+    "Resources": {
+      "cluster": {
+        "Type": "AWS::EMR::Cluster",
+        "Properties": {
+          "Applications":[
+            {
+                "Name" : "Spark"
+            }
+          ],
+          "Instances": {
+            "Ec2KeyName": {
+                "Ref": "KeyName"
+            },
+            "MasterInstanceGroup": {
+              "InstanceCount": 1,
+              "InstanceType": {"Ref" : "InstanceType"},
+              "Market": "ON_DEMAND",
+              "Name": "cfnMaster"
+            },
+            "CoreInstanceGroup": {
+              "InstanceCount": 1,
+              "InstanceType": {"Ref" : "InstanceType"},
+              "Market": "ON_DEMAND",
+              "Name": "cfnCore"
+            },
+            "TerminationProtected" : {"Ref" : "TerminationProtected"},
+            "Ec2SubnetId" : {"Ref" : "SubnetId"}
+          },
+          "Name": "my cluster for emr cft testing",
+          "JobFlowRole" : "EMR_EC2_DefaultRole",
+          "ServiceRole" : "EMR_DefaultRole",
+          "ReleaseLabel" : {"Ref" : "ReleaseLabel"},
+          "VisibleToAllUsers" : true
+        }
+      },
+      "SparkStep": {
+        "Type": "AWS::EMR::Step",
+        "Properties": {
+            "Name": "SparkStep",
+            "ActionOnFailure": "CONTINUE",
+            "HadoopJarStep": {
+                "Jar": "command-runner.jar",
+                "Args": [
+                    "spark-submit",
+                    "--deploy-mode",
+                    "cluster",
+                    "S3 pe ka script file ka location"
+                ]  
+            },
+            "JobFlowId": {
+                "Ref": "cluster"
+            }            
+        }        
+      }
+    }
+  }
+
+
+
+############################################################
+############################################################
+SPARK JOB
+
+import sys
+from pyspark.sql.functions import *
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("FirstJob").getOrCreate()
+
+death = spark.read.format("csv").option("header","true").option("inferSchema","true").load("path to s3 bucket")
+death = death.withColumnRenamed("killed_by","Weapon_name")
+death = death.na.drop(how='any')
+death.write.format("parquet").mode("overwrite").save("s3 path where you want to store parquet file")
+
+match = spark.read.format("csv").option("header","true").option("inferSchema","true").load("path to s3 bucket")
+match_new = split(col("date"), "T")
+match_pro = match.select(match_new[0].alias("date"), match_new[1].alias("time"),"game_size", "match_id", "match_mode", "party_size","player_assists", "player_dbno", "player_dist_ride", "player_dist_walk", "player_dmg", "player_kills", "player_name", "player_survive_time","team_id","team_placement")
+d= r'\+0000$'
+b= r'\d{9}$'
+match_clean = match_pro.select("date", regexp_replace(match_pro['time'],d,'').alias('time'), "game_size","match_id", "match_mode", "party_size", "player_assists", "player_dbno", regexp_replace(match_pro["player_dist_ride"],b,'').alias("player_dist_ride"), regexp_replace(match_pro["player_dist_walk"],b,'').alias("player_dist_walk"), "player_dmg", "player_kills", "player_name", regexp_replace(match["player_survive_time"],b,'').alias("player_survive_time"), "team_id", "team_placement")
+match_clean = match_clean.na.drop(how='any')
+match_clean.write.format("parquet").mode("overwrite").save("s3://bigdataprojectgroup5/match_new/match.parquet")
+
+spark.stop()
+
